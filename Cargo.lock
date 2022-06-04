@@ -1111,6 +1111,7 @@ dependencies = [
  "clap",
  "indicatif",
  "inventory",
+ "lazy_static",
  "regex",
  "scraper",
  "serde_json",

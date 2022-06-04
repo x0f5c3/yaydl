@@ -17,19 +17,27 @@
 // - YouTube handler -
 
 use crate::definitions::SiteDefinition;
+use std::sync::Mutex;
 
-use anyhow::Result;
+use anyhow::{anyhow, Result};
+use lazy_static::lazy_static;
 use regex::Regex;
 use serde_json::{json, Value};
+use url::form_urlencoded::Target;
 
-static mut VIDEO_INFO: String = String::new();
-static mut VIDEO_MIME: String = String::new();
+lazy_static! {
+    static ref VIDEO_INFO: Mutex<String> = Mutex::new(String::new());
+    static ref VIDEO_MIME: Mutex<String> = Mutex::new(String::new());
+}
 
-unsafe fn get_video_info(id: &str) -> Result<Value> {
-    if VIDEO_INFO.is_empty() {
+fn get_video_info(id: &str) -> Result<Value> {
+    let mut lock = VIDEO_INFO
+        .lock()
+        .map_err(|x| anyhow!("Poison error {}", x.to_string()))?;
+    if lock.is_empty() {
         // We need to fetch the video information first.
         let video_url = "https://youtubei.googleapis.com/youtubei/v1/player?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8";
-        let req = ureq::post(&video_url).send_json(ureq::json!({
+        let req = ureq::post(video_url).send_json(ureq::json!({
             "videoId": id,
             "context": {
                 "client": {
@@ -38,12 +46,13 @@ unsafe fn get_video_info(id: &str) -> Result<Value> {
                 }
             }
         }))?;
-        let body = req.into_string()?;
-        VIDEO_INFO = body;
+        let mut body = req.into_string()?;
+        let mut write_lock = lock.as_mut_string();
+        write_lock = &mut body;
     }
 
     // Return it:
-    let v: Value = serde_json::from_str(&VIDEO_INFO)?;
+    let v: Value = serde_json::from_str(&lock)?;
     Ok(v)
 }
 
@@ -56,131 +65,134 @@ impl SiteDefinition for YouTubeHandler {
             .is_match(url)
     }
 
-    fn find_video_title<'a>(&'a self, url: &'a str) -> Result<String> {
-        let id_regex = Regex::new(r"(?:v=|.be/)(.*$)").unwrap();
-        let id = id_regex.captures(url).unwrap().get(1).unwrap().as_str();
-        unsafe {
-            let video_info = get_video_info(id)?;
-            let video_info_title = video_info["videoDetails"]["title"].as_str().unwrap_or("");
-
-            Ok(String::from(video_info_title))
-        }
-    }
-
-    fn find_video_direct_url<'a>(&'a self, url: &'a str, onlyaudio: bool) -> Result<String> {
-        let id_regex = Regex::new(r"(?:v=|.be/)(.*$)").unwrap();
-        let id = id_regex.captures(url).unwrap().get(1).unwrap().as_str();
-        unsafe {
-            let video_info = get_video_info(id)?;
-            let video_info_itags = match video_info["streamingData"]["formats"].as_array() {
-                None => return Ok("".to_string()),
-                Some(itags) => itags,
-            };
-            let video_info_itags_adaptive =
-                match video_info["streamingData"]["adaptiveFormats"].as_array() {
-                    None => return Ok("".to_string()),
-                    Some(itags) => itags,
-                };
-
-            let mut url_to_choose = "";
-
-            // Finding the least horrible combination of video and audio:
-            let vq1 = "tiny";
-            let vq2 = "small";
-            let vq3 = "medium";
-            let vq4 = "large";
-            let vq5 = "hd720";
-            let vq6 = "hd1080";
-            let mut last_vq = "".to_string();
-
-            let aq1 = "AUDIO_QUALITY_LOW";
-            let aq2 = "AUDIO_QUALITY_MEDIUM";
-            let aq3 = "AUDIO_QUALITY_HIGH";
-            let mut last_aq = "".to_string();
-
-            for itag in video_info_itags.iter().chain(video_info_itags_adaptive) {
-                // The highest quality wins.
-                let this_aq = itag["audioQuality"].as_str().unwrap_or("");
-                let this_vq = itag["quality"].as_str().unwrap_or("");
-
-                let is_better_audio = (last_aq.is_empty() && !this_aq.is_empty())
-                    || (last_aq == aq1 && (this_aq == aq2 || this_aq == aq3))
-                    || (last_aq == aq2 && this_aq == aq3);
-                let is_same_or_better_audio = (last_aq == this_aq) || is_better_audio;
-
-                let is_better_video = (last_vq.is_empty() && !this_vq.is_empty())
-                    || (last_vq == vq1
-                        && (this_vq == vq2
-                            || this_vq == vq3
-                            || this_vq == vq4
-                            || this_vq == vq5
-                            || this_vq == vq6))
-                    || (last_vq == vq2
-                        && (this_vq == vq3 || this_vq == vq4 || this_vq == vq5 || this_vq == vq6))
-                    || (last_vq == vq3 && (this_vq == vq4 || this_vq == vq5 || this_vq == vq6))
-                    || (last_vq == vq4 && (this_vq == vq5 || this_vq == vq6))
-                    || (last_vq == vq5 && this_vq == vq6);
-                let is_same_or_better_video = (last_vq == this_vq) || is_better_video;
-
-                let is_better_quality = (is_better_audio && is_same_or_better_video)
-                    || (is_better_video && is_same_or_better_audio)
-                    || (onlyaudio && is_better_audio);
-
-                // If audio: Try to download the best audio quality.
-                // If video: Try to download the best combination.
-                if (onlyaudio && itag["mimeType"].to_string().contains("audio/")
-                    || !onlyaudio && itag["mimeType"].to_string().contains("video/"))
-                    && (!onlyaudio || itag["quality"] != json!(null))
-                    && itag["audioQuality"] != json!(null)
-                    && (onlyaudio && this_vq.is_empty()
-                        || !onlyaudio && last_vq.is_empty() && !this_vq.is_empty())
-                    || is_better_quality
-                {
-                    VIDEO_MIME = itag["mimeType"].to_string();
-                    url_to_choose = itag["url"].as_str().unwrap();
-
-                    last_vq = String::from(this_vq);
-                    last_aq = String::from(this_aq);
-                }
-            }
-
-            if url_to_choose.is_empty() {
-                Err(anyhow::Error::msg(
-                    "Could not find a working itag - aborting.".to_string(),
-                ))
-            } else {
-                Ok(url_to_choose.to_string())
-            }
-        }
-    }
-
     fn does_video_exist<'a>(&'a self, url: &'a str) -> Result<bool> {
         let id_regex = Regex::new(r"(?:v=|.be/)(.*$)").unwrap();
         let id = id_regex.captures(url).unwrap().get(1).unwrap().as_str();
-        unsafe {
-            let video_info = get_video_info(id)?;
-            let video_info_is_playable = video_info["playabilityStatus"]["status"] == json!("OK");
-            let video_info_has_details = video_info["videoDetails"] != json!(null);
-            Ok(video_info_has_details && video_info_is_playable)
-        }
+        let video_info = get_video_info(id)?;
+        let video_info_is_playable = video_info["playabilityStatus"]["status"] == json!("OK");
+        let video_info_has_details = video_info["videoDetails"] != json!(null);
+        Ok(video_info_has_details && video_info_is_playable)
     }
 
-    fn display_name<'a>(&'a self) -> String {
-        "YouTube".to_string()
+    fn find_video_title<'a>(&'a self, url: &'a str) -> Result<String> {
+        let id_regex = Regex::new(r"(?:v=|.be/)(.*$)").unwrap();
+        let id = id_regex.captures(url).unwrap().get(1).unwrap().as_str();
+        let video_info = get_video_info(id)?;
+        let video_info_title = video_info["videoDetails"]["title"].as_str().unwrap_or("");
+
+        Ok(String::from(video_info_title))
+    }
+
+    fn find_video_direct_url<'a>(&'a self, url: &'a str, onlyaudio: bool) -> Result<String> {
+        let id_regex = Regex::new(r"(?:v=|.be/)(.*$)")?;
+        let id = id_regex
+            .captures(url)
+            .and_then(|x| x.get(1))
+            .ok_or_else(|| anyhow!("No id in the URL"))?
+            .as_str();
+        let video_info = get_video_info(id)?;
+        let video_info_itags = match video_info["streamingData"]["formats"].as_array() {
+            None => return Ok("".to_string()),
+            Some(itags) => itags,
+        };
+        let video_info_itags_adaptive =
+            match video_info["streamingData"]["adaptiveFormats"].as_array() {
+                None => return Ok("".to_string()),
+                Some(itags) => itags,
+            };
+
+        let mut url_to_choose = "";
+
+        // Finding the least horrible combination of video and audio:
+        let vq1 = "tiny";
+        let vq2 = "small";
+        let vq3 = "medium";
+        let vq4 = "large";
+        let vq5 = "hd720";
+        let vq6 = "hd1080";
+        let mut last_vq = "".to_string();
+
+        let aq1 = "AUDIO_QUALITY_LOW";
+        let aq2 = "AUDIO_QUALITY_MEDIUM";
+        let aq3 = "AUDIO_QUALITY_HIGH";
+        let mut last_aq = "".to_string();
+
+        for itag in video_info_itags.iter().chain(video_info_itags_adaptive) {
+            // The highest quality wins.
+            let this_aq = itag["audioQuality"].as_str().unwrap_or("");
+            let this_vq = itag["quality"].as_str().unwrap_or("");
+
+            let is_better_audio = (last_aq.is_empty() && !this_aq.is_empty())
+                || (last_aq == aq1 && (this_aq == aq2 || this_aq == aq3))
+                || (last_aq == aq2 && this_aq == aq3);
+            let is_same_or_better_audio = (last_aq == this_aq) || is_better_audio;
+
+            let is_better_video = (last_vq.is_empty() && !this_vq.is_empty())
+                || (last_vq == vq1
+                    && (this_vq == vq2
+                        || this_vq == vq3
+                        || this_vq == vq4
+                        || this_vq == vq5
+                        || this_vq == vq6))
+                || (last_vq == vq2
+                    && (this_vq == vq3 || this_vq == vq4 || this_vq == vq5 || this_vq == vq6))
+                || (last_vq == vq3 && (this_vq == vq4 || this_vq == vq5 || this_vq == vq6))
+                || (last_vq == vq4 && (this_vq == vq5 || this_vq == vq6))
+                || (last_vq == vq5 && this_vq == vq6);
+            let is_same_or_better_video = (last_vq == this_vq) || is_better_video;
+
+            let is_better_quality = (is_better_audio && is_same_or_better_video)
+                || (is_better_video && is_same_or_better_audio)
+                || (onlyaudio && is_better_audio);
+
+            // If audio: Try to download the best audio quality.
+            // If video: Try to download the best combination.
+            if (onlyaudio && itag["mimeType"].to_string().contains("audio/")
+                || !onlyaudio && itag["mimeType"].to_string().contains("video/"))
+                && (!onlyaudio || itag["quality"] != json!(null))
+                && itag["audioQuality"] != json!(null)
+                && (onlyaudio && this_vq.is_empty()
+                    || !onlyaudio && last_vq.is_empty() && !this_vq.is_empty())
+                || is_better_quality
+            {
+                let mut lock = VIDEO_MIME
+                    .lock()
+                    .map_err(|x| anyhow!("Poison error {}", x.to_string()))?
+                    .as_mut_string();
+                lock = &mut itag["mimeType"].to_string();
+                url_to_choose = itag["url"].as_str().unwrap();
+
+                last_vq = String::from(this_vq);
+                last_aq = String::from(this_aq);
+            }
+        }
+
+        if url_to_choose.is_empty() {
+            Err(anyhow::Error::msg(
+                "Could not find a working itag - aborting.".to_string(),
+            ))
+        } else {
+            Ok(url_to_choose.to_string())
+        }
     }
 
     fn find_video_file_extension<'a>(&'a self, _url: &'a str, _onlyaudio: bool) -> Result<String> {
         // By this point, we have already filled VIDEO_MIME. Let's just use that.
-        unsafe {
-            let mut ext = "mp4";
-            if VIDEO_MIME.contains("/webm") {
-                ext = "webm";
-            } else if VIDEO_MIME.contains("audio/mp4") {
-                ext = "m4a";
-            }
-
-            Ok(ext.to_string())
+        let lock = VIDEO_MIME
+            .lock()
+            .map_err(|x| anyhow!("Poison error: {}", x))?;
+        let mut ext = "mp4";
+        if lock.contains("/webm") {
+            ext = "webm";
+        } else if lock.contains("audio/mp4") {
+            ext = "m4a";
         }
+
+        Ok(ext.to_string())
+    }
+
+    fn display_name<'a>(&'a self) -> String {
+        "YouTube".to_string()
     }
 }
 

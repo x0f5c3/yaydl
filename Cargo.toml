@@ -12,6 +12,7 @@ keywords = ["youtube", "downloading", "video"]
 [dependencies]
 anyhow = "1.0"
 cienli = "0.1"
+lazy_static = "1.4.0"
 clap = "3.0.0-beta.2"
 indicatif = "0.15"
 inventory = "0.1"
